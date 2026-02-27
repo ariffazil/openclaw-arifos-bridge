@@ -1,16 +1,13 @@
 /**
  * arifOS Bridge Extension for OpenClaw
  * 
- * ⚠️  TEMPORARY REST SHIM — Migration Path Only
+ * Phase 4 Step 1: Stateless MCP-Native Bridge (Option B)
  * 
- * Current: OpenClaw → REST POST /tools/{name} → arifOS
- * Target:  OpenClaw → MCP JSON-RPC/SSE → arifOS
+ * Protocol: Per-call MCP (initialize -> notifications/initialized -> tools/call)
+ * Target: arifOS /mcp endpoint (port 8088)
+ * Previous: REST shim (removed from primary flow)
  * 
- * This implementation uses REST as a short-lived migration path to verify
- * operator flow end-to-end. The canonical boundary should be MCP-native.
- * 
- * TODO: Return to MCP-native bridge once operator flow is proven.
- * Issue: MCP session management complexity in Docker networking context.
+ * This is the canonical boundary. No REST fallback.
  * 
  * DITEMPA BUKAN DIBERI
  */
@@ -18,108 +15,219 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
 
-// TEMPORARY: REST endpoint for migration verification
-// Canonical target: http://10.0.0.3:8088/mcp (MCP-native)
-const ARIFOS_REST_ENDPOINT = process.env.ARIFOS_REST_ENDPOINT || "http://10.0.0.3:8080";
+// Canonical MCP endpoint (internal Docker network)
+// Port 8080: arifOS MCP (mapped to 8088 on host)
+const ARIFOS_MCP_ENDPOINT = process.env.ARIFOS_MCP_ENDPOINT || "http://10.0.0.3:8080/mcp";
 
-// Canonical MCP endpoint (for future migration back)
-const ARIFOS_MCP_ENDPOINT = process.env.ARIFOS_MCP_ENDPOINT || "http://10.0.0.3:8088/mcp";
+interface MCPRequest {
+  jsonrpc: "2.0";
+  id: number;
+  method: string;
+  params?: Record<string, any>;
+}
 
-interface ArifOSJudgeResult {
-  verdict: "SEAL" | "VOID" | "PARTIAL" | "SABAR" | "888_HOLD" | string;
-  stage?: string;
-  reason?: string;
-  confidence?: number;
-  error?: string;
+interface BridgeMetrics {
+  sessionInitMs: number;
+  toolCallMs: number;
+  totalMs: number;
+  verdict: string;
+  stage: string;
+  timestamp: string;
+}
+
+let requestId = 0;
+
+/**
+ * Parse SSE response stream for MCP
+ */
+async function parseSSEResponse(response: Response): Promise<any> {
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("No response body");
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let lastResult: any = null;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      if (line.startsWith("data: ")) {
+        const data = line.slice(6).trim();
+        if (data === "[DONE]") continue;
+        if (!data) continue;
+
+        try {
+          const parsed = JSON.parse(data);
+          
+          // Handle initialize response
+          if (parsed.result?.protocolVersion) {
+            lastResult = parsed.result;
+          }
+          // Handle tool call response
+          else if (parsed.result?.content) {
+            lastResult = parsed.result;
+          }
+          // Handle errors
+          else if (parsed.error) {
+            throw new Error(`MCP error: ${parsed.error.message}`);
+          }
+        } catch (e) {
+          if (e instanceof Error && e.message.startsWith("MCP error")) throw e;
+          // Continue reading if parse fails
+        }
+      }
+    }
+  }
+
+  return lastResult;
 }
 
 /**
- * TEMPORARY REST implementation for migration verification.
- * 
- * TODO: Replace with MCP-native call once session handling is resolved.
- * See: arifos_aaa_mcp/server.py for canonical MCP interface.
+ * Initialize MCP session (stateless - per call)
  */
-async function apexJudgeREST(
-  query: string,
-  sessionId: string,
-  actorId: string
-): Promise<ArifOSJudgeResult> {
-  const response = await fetch(`${ARIFOS_REST_ENDPOINT}/tools/apex_judge`, {
+async function initializeMCP(): Promise<{ sessionId: string; capabilities: any }> {
+  const startTime = Date.now();
+  
+  const req: MCPRequest = {
+    jsonrpc: "2.0",
+    id: ++requestId,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-11-25",
+      capabilities: {},
+      clientInfo: {
+        name: "openclaw-bridge",
+        version: "2026.02.27"
+      }
+    }
+  };
+
+  const response = await fetch(ARIFOS_MCP_ENDPOINT, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream"
     },
-    body: JSON.stringify({
-      query,
-      session_id: sessionId,
-      actor_id: actorId,
-    }),
+    body: JSON.stringify(req)
   });
 
   if (!response.ok) {
-    const errorText = await response.text();
-    return {
-      verdict: "VOID",
-      error: `arifOS HTTP ${response.status}: ${errorText}`,
-    };
+    throw new Error(`MCP initialize failed: HTTP ${response.status}`);
   }
 
-  const data = await response.json();
-  const result = data.result || data;
-  
-  if (result.verdict) {
-    return {
-      verdict: result.verdict,
-      stage: result.stage || result.data?.stage,
-      reason: result.reason || result.data?.verdict,
-      confidence: result.confidence,
-    };
-  }
-  
-  if (result.data?.verdict) {
-    return {
-      verdict: result.data.verdict,
-      stage: result.data.stage,
-      reason: result.data.verdict,
-    };
-  }
+  // Extract session ID from headers if present
+  const sessionId = response.headers.get("MCP-Session-Id") || 
+                   response.headers.get("mcp-session-id") ||
+                   `session-${Date.now()}`;
+
+  const result = await parseSSEResponse(response);
   
   return {
-    verdict: "VOID",
-    error: "Unexpected response format",
-    reason: JSON.stringify(result).substring(0, 200),
+    sessionId,
+    capabilities: result?.capabilities || {},
+    initTimeMs: Date.now() - startTime
   };
 }
 
 /**
- * PLACEHOLDER: MCP-native implementation (target architecture)
- * 
- * Requires:
- * - Session initialization via POST /mcp (initialize)
- * - Session ID extraction from MCP-Session-Id header
- * - Subsequent calls with MCP-Session-Id header
- * - SSE stream parsing for responses
- * 
- * Blocked by: Docker container session persistence complexity
+ * Call MCP tool with initialized session
  */
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
+async function callToolMCP(
+  toolName: string,
+  args: any,
+  sessionId: string
+): Promise<any> {
+  const startTime = Date.now();
+  
+  const req: MCPRequest = {
+    jsonrpc: "2.0",
+    id: ++requestId,
+    method: "tools/call",
+    params: {
+      name: toolName,
+      arguments: args
+    }
+  };
+
+  const response = await fetch(ARIFOS_MCP_ENDPOINT, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
+      "MCP-Session-Id": sessionId
+    },
+    body: JSON.stringify(req)
+  });
+
+  if (!response.ok) {
+    throw new Error(`MCP tool call failed: HTTP ${response.status}`);
+  }
+
+  const result = await parseSSEResponse(response);
+  
+  // Parse content if it's text
+  const content = result?.content?.[0]?.text;
+  if (content) {
+    try {
+      return JSON.parse(content);
+    } catch {
+      return { verdict: "VOID", error: content };
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Stateless MCP apex_judge call
+ * Per-call flow: initialize -> call
+ */
 async function apexJudgeMCP(
-  _query: string,
-  _sessionId: string,
-  _actorId: string
-): Promise<ArifOSJudgeResult> {
-  // TODO: Implement canonical MCP protocol
-  // 1. Initialize session: POST /mcp {method: "initialize", ...}
-  // 2. Extract MCP-Session-Id from response headers
-  // 3. Call tools/call with session header
-  // 4. Parse SSE response stream
-  throw new Error("MCP-native not yet implemented — use apexJudgeREST");
+  query: string,
+  sessionId: string,
+  actorId: string
+): Promise<{ result: any; metrics: BridgeMetrics }> {
+  const totalStart = Date.now();
+  
+  // Step 1: Initialize session
+  const { sessionId: mcpSessionId, initTimeMs } = await initializeMCP();
+  
+  // Step 2: Call tool
+  const toolStart = Date.now();
+  const result = await callToolMCP("apex_judge", {
+    query,
+    session_id: sessionId
+  }, mcpSessionId);
+  
+  const toolTimeMs = Date.now() - toolStart;
+  const totalMs = Date.now() - totalStart;
+
+  // Extract verdict for metrics
+  const verdict = result?.verdict || result?.data?.verdict || "UNKNOWN";
+  const stage = result?.stage || result?.data?.stage || "N/A";
+
+  const metrics: BridgeMetrics = {
+    sessionInitMs: initTimeMs,
+    toolCallMs: toolTimeMs,
+    totalMs,
+    verdict,
+    stage,
+    timestamp: new Date().toISOString()
+  };
+
+  return { result, metrics };
 }
 
 const arifOSBridgePlugin = {
   id: "arifos-bridge",
   name: "arifOS Constitutional Bridge",
-  description: "Bridge to arifOS constitutional kernel (TEMPORARY REST SHIM)",
+  description: "MCP-native bridge to arifOS 13-floor governance (Phase 4)",
   kind: "tool" as const,
   configSchema: emptyPluginConfigSchema(),
   
@@ -129,7 +237,7 @@ const arifOSBridgePlugin = {
     api.registerTool(
       () => ({
         name: "arifos_judge",
-        description: "Constitutional evaluation (F1-F13). TEMP: Uses REST shim, target is MCP-native.",
+        description: "Constitutional evaluation via MCP-native bridge (F1-F13). Returns SEAL, VOID, PARTIAL, SABAR, or 888_HOLD.",
         parameters: {
           type: "object",
           properties: {
@@ -141,36 +249,53 @@ const arifOSBridgePlugin = {
           required: ["query"]
         },
         async execute(args: { query: string }, ctx: any) {
-          logger.info(`[arifOS Bridge/REST] Judging: "${args.query.substring(0, 50)}..."`);
+          const startTime = Date.now();
           
-          // TEMPORARY: Using REST shim for migration verification
-          // TODO: Switch to apexJudgeMCP once session handling resolved
-          const result = await apexJudgeREST(
-            args.query,
-            ctx.sessionKey || `session-${Date.now()}`,
-            ctx.userId || "openclaw"
-          );
+          logger.info(`[arifOS Bridge/MCP] Judging: "${args.query.substring(0, 50)}..."`);
           
-          logger.info(`[arifOS Bridge/REST] Verdict: ${result.verdict}`);
-          
-          return {
-            verdict: result.verdict,
-            stage: result.stage || "888_JUDGE",
-            reason: result.reason || result.error,
-            confidence: result.confidence,
-            // Mark as REST shim for debugging
-            _bridge_mode: "REST_SHIM",
-            _canonical_target: "MCP_NATIVE",
-          };
+          try {
+            // STATELESS MCP: initialize -> call (per request)
+            const { result, metrics } = await apexJudgeMCP(
+              args.query,
+              ctx.sessionKey || `session-${Date.now()}`,
+              ctx.userId || "openclaw"
+            );
+            
+            // Log metrics
+            logger.info(`[arifOS Bridge/MCP] Verdict: ${metrics.verdict} (${metrics.stage})`);
+            logger.info(`[arifOS Bridge/MCP] Latency: init=${metrics.sessionInitMs}ms, tool=${metrics.toolCallMs}ms, total=${metrics.totalMs}ms`);
+            
+            return {
+              verdict: metrics.verdict,
+              stage: metrics.stage,
+              reason: result?.reason || result?.data?.verdict,
+              confidence: result?.confidence,
+              _bridge: "MCP_NATIVE",
+              _metrics: {
+                session_init_ms: metrics.sessionInitMs,
+                tool_call_ms: metrics.toolCallMs,
+                total_ms: metrics.totalMs
+              }
+            };
+          } catch (error) {
+            const errorMsg = error instanceof Error ? error.message : String(error);
+            logger.error(`[arifOS Bridge/MCP] Error: ${errorMsg}`);
+            
+            return {
+              verdict: "VOID",
+              stage: "888_ERROR",
+              reason: errorMsg,
+              _bridge: "MCP_NATIVE",
+              _error: true
+            };
+          }
         }
       }),
       { names: ["arifos_judge"] }
     );
 
-    logger.warn(`[arifOS Bridge] ⚠️  RUNNING TEMPORARY REST SHIM`);
-    logger.warn(`[arifOS Bridge]    Endpoint: ${ARIFOS_REST_ENDPOINT}`);
-    logger.warn(`[arifOS Bridge]    Target:   ${ARIFOS_MCP_ENDPOINT} (NOT YET ACTIVE)`);
-    logger.info(`[arifOS Bridge] Registered arifos_judge tool`);
+    logger.info(`[arifOS Bridge] MCP-native bridge registered (endpoint: ${ARIFOS_MCP_ENDPOINT})`);
+    logger.info(`[arifOS Bridge] Protocol: Stateless MCP (Option B)`);
   }
 };
 
